@@ -31,6 +31,17 @@ class StreamConfig:
     market_ids: list[int] | None = None
     writer_max_batch: int = 500
     writer_flush_interval_ms: int = 50
+    ws_shards: int = 4
+    queue_drop_threshold: int = 15000
+
+
+@dataclass
+class StreamMetrics:
+    recv_count: int = 0
+    enqueued_count: int = 0
+    reconnects: int = 0
+    dropped_orderbook: int = 0
+    dropped_snapshot: int = 0
 
 
 class SqliteStreamWriter:
@@ -38,9 +49,11 @@ class SqliteStreamWriter:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
+        self.conn.execute("PRAGMA cache_size=-200000;")
         create_schema(self.conn)
         self.repo = Repository(self.conn)
-        self.queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=20000)
+        self.queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=50000)
         self._running = True
         self.max_batch = max_batch
         self.flush_interval_sec = max(flush_interval_ms / 1000.0, 0.005)
@@ -72,7 +85,6 @@ class SqliteStreamWriter:
             }
             iid = self.repo.upsert_instrument(inst)
             instrument_ids[mid] = iid
-
             self.repo.upsert_fee(
                 {
                     "instrument_id": iid,
@@ -140,10 +152,10 @@ def _price_from_node(node: Any) -> float | None:
     return to_float(node)
 
 
-def _extract_ticker(payload: dict[str, Any]) -> tuple[float | None, float | None, str | None]:
+def _extract_ticker(payload: dict[str, Any], msg: dict[str, Any]) -> tuple[float | None, float | None, str | None]:
     ask = _price_from_node(payload.get("ask") or payload.get("a"))
     bid = _price_from_node(payload.get("bid") or payload.get("b"))
-    ts = ms_to_iso8601(payload.get("timestamp") or payload.get("ts") or payload.get("t"))
+    ts = ms_to_iso8601(payload.get("timestamp") or payload.get("ts") or payload.get("t") or msg.get("timestamp"))
     return bid, ask, ts
 
 
@@ -156,100 +168,97 @@ def _extract_funding_rate(payload: dict[str, Any]) -> float | None:
     )
 
 
-async def run_lighter_ws_stream(config: StreamConfig) -> None:
-    client = LighterClient()
-    details = client.get_order_book_details()
-    discovered_market_ids = [
-        int(d.get("id") or d.get("market_id"))
-        for d in details
-        if (d.get("id") is not None or d.get("market_id") is not None)
-    ]
-    market_ids = config.market_ids or discovered_market_ids
-    market_set = set(market_ids)
-    details = [
-        d
-        for d in details
-        if int(d.get("id") or d.get("market_id")) in market_set
-    ]
+def _shard_markets(market_ids: list[int], shard_count: int) -> list[list[int]]:
+    if shard_count <= 1:
+        return [market_ids]
+    shards: list[list[int]] = [[] for _ in range(shard_count)]
+    for idx, mid in enumerate(market_ids):
+        shards[idx % shard_count].append(mid)
+    return [s for s in shards if s]
 
-    writer = SqliteStreamWriter(
-        config.db_path,
-        max_batch=config.writer_max_batch,
-        flush_interval_ms=config.writer_flush_interval_ms,
-    )
-    instrument_ids = writer.upsert_market_definitions(details)
 
-    writer_task = asyncio.create_task(writer.run())
-    market_state: dict[int, dict[str, Any]] = {mid: {} for mid in market_ids}
-    last_snapshot_emit: dict[int, float] = {mid: 0.0 for mid in market_ids}
+async def _subscribe_shard(ws: websockets.WebSocketClientProtocol, mids: list[int]) -> None:
+    for mid in mids:
+        for prefix in ("ticker", "order_book", "trade", "market_stats"):
+            await ws.send(json.dumps({"type": "subscribe", "channel": f"{prefix}/{mid}"}))
 
+
+async def _run_ws_shard(
+    shard_id: int,
+    mids: list[int],
+    config: StreamConfig,
+    writer: SqliteStreamWriter,
+    instrument_ids: dict[int, int],
+    metrics: StreamMetrics,
+    stop_event: asyncio.Event,
+) -> None:
+    market_state: dict[int, dict[str, Any]] = {mid: {} for mid in mids}
+    last_snapshot_emit: dict[int, float] = {mid: 0.0 for mid in mids}
     backoff = config.reconnect_base_sec
-    reconnects = 0
-    recv_count = 0
-    enqueue_count = 0
-    last_hb = time.monotonic()
-    logger.info("lighter ws stream starting markets=%d", len(market_ids))
 
-    try:
-        while True:
-            try:
-                async with websockets.connect(
-                    WS_URL,
-                    ping_interval=15,
-                    ping_timeout=60,
-                    close_timeout=10,
-                    max_queue=4000,
-                ) as ws:
-                    logger.info("lighter ws connected url=%s", WS_URL)
-                    backoff = config.reconnect_base_sec
+    logger.info("lighter ws shard start shard=%d markets=%d", shard_id, len(mids))
 
-                    for mid in market_ids:
-                        for prefix in ("ticker", "order_book", "trade", "market_stats"):
-                            await ws.send(json.dumps({"type": "subscribe", "channel": f"{prefix}/{mid}"}))
-                    logger.info("lighter ws subscriptions sent total=%d", len(market_ids) * 4)
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=15,
+                ping_timeout=60,
+                close_timeout=10,
+                max_queue=4000,
+                compression=None,
+            ) as ws:
+                logger.info("lighter ws connected shard=%d url=%s", shard_id, WS_URL)
+                await _subscribe_shard(ws, mids)
+                logger.info("lighter ws subscriptions sent shard=%d total=%d", shard_id, len(mids) * 4)
+                backoff = config.reconnect_base_sec
 
-                    async for raw in ws:
-                        recv_count += 1
-                        msg = json.loads(raw)
-                        if not isinstance(msg, dict):
-                            continue
-                        msg_type = msg.get("type")
-                        if msg_type in {"connected", "subscribed"}:
-                            continue
+                async for raw in ws:
+                    metrics.recv_count += 1
+                    msg = json.loads(raw)
+                    if not isinstance(msg, dict):
+                        continue
+                    msg_type = msg.get("type")
+                    if msg_type in {"connected", "subscribed"}:
+                        continue
 
-                        channel = str(msg.get("channel") or "").replace(":", "/")
-                        data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
-                        if not channel:
-                            continue
-                        parts = channel.split("/")
-                        if len(parts) != 2:
-                            continue
+                    channel = str(msg.get("channel") or "").replace(":", "/")
+                    data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
+                    if not channel:
+                        continue
+                    parts = channel.split("/")
+                    if len(parts) != 2:
+                        continue
 
-                        topic, mid_text = parts
-                        try:
-                            mid = int(mid_text)
-                        except ValueError:
-                            continue
-                        instrument_id = instrument_ids.get(mid)
-                        if instrument_id is None:
-                            continue
+                    topic, mid_text = parts
+                    try:
+                        mid = int(mid_text)
+                    except ValueError:
+                        continue
+                    instrument_id = instrument_ids.get(mid)
+                    if instrument_id is None:
+                        continue
 
-                        now = time.time()
-                        collected_at = now_iso8601()
+                    now = time.time()
+                    collected_at = now_iso8601()
+                    qsize = writer.queue.qsize()
 
-                        if topic == "ticker":
-                            if isinstance(msg.get("ticker"), dict):
-                                data = msg["ticker"]
-                            bid, ask, ex_ts = _extract_ticker(data)
-                            state = market_state[mid]
-                            state["best_bid"] = bid
-                            state["best_ask"] = ask
-                            state["exchange_ts"] = ex_ts
-                            should_emit_snapshot = (
-                                config.snapshot_interval_sec <= 0
-                                or now - last_snapshot_emit[mid] >= config.snapshot_interval_sec
-                            )
-                            if should_emit_snapshot:
+                    if topic == "ticker":
+                        if isinstance(msg.get("ticker"), dict):
+                            data = msg["ticker"]
+                        bid, ask, ex_ts = _extract_ticker(data, msg)
+                        state = market_state[mid]
+                        state["best_bid"] = bid
+                        state["best_ask"] = ask
+                        state["exchange_ts"] = ex_ts
+                        should_emit_snapshot = (
+                            config.snapshot_interval_sec <= 0
+                            or now - last_snapshot_emit[mid] >= config.snapshot_interval_sec
+                        )
+                        if should_emit_snapshot:
+                            if qsize > config.queue_drop_threshold:
+                                metrics.dropped_snapshot += 1
+                            else:
                                 await writer.enqueue(
                                     "snapshot",
                                     {
@@ -268,14 +277,17 @@ async def run_lighter_ws_stream(config: StreamConfig) -> None:
                                         "raw_json": json.dumps(data, ensure_ascii=True),
                                     },
                                 )
-                                enqueue_count += 1
+                                metrics.enqueued_count += 1
                                 last_snapshot_emit[mid] = now
 
-                        elif topic == "order_book":
-                            if isinstance(msg.get("order_book"), dict):
-                                data = msg["order_book"]
-                            asks = data.get("asks") or []
-                            bids = data.get("bids") or []
+                    elif topic == "order_book":
+                        if isinstance(msg.get("order_book"), dict):
+                            data = msg["order_book"]
+                        asks = data.get("asks") or []
+                        bids = data.get("bids") or []
+                        if qsize > config.queue_drop_threshold:
+                            metrics.dropped_orderbook += 1
+                        else:
                             await writer.enqueue(
                                 "orderbook",
                                 {
@@ -288,94 +300,158 @@ async def run_lighter_ws_stream(config: StreamConfig) -> None:
                                     "raw_json": json.dumps(data, ensure_ascii=True),
                                 },
                             )
-                            enqueue_count += 1
+                            metrics.enqueued_count += 1
 
-                        elif topic == "trade":
-                            if isinstance(msg.get("trades"), list):
-                                trades = msg["trades"]
-                            else:
-                                trades = []
-                            if isinstance(msg.get("liquidation_trades"), list):
-                                trades.extend(msg["liquidation_trades"])
-                            if not trades:
-                                trades = data if isinstance(data, list) else [data]
-                            for trade in trades:
-                                if not isinstance(trade, dict):
-                                    continue
-                                trade_id = str(trade.get("trade_id") or trade.get("id") or "")
-                                if not trade_id:
-                                    continue
-                                await writer.enqueue(
-                                    "trade",
-                                    {
-                                        "instrument_id": instrument_id,
-                                        "trade_id": trade_id,
-                                        "exchange_ts": ms_to_iso8601(
-                                            trade.get("timestamp")
-                                            or trade.get("ts")
-                                            or trade.get("transaction_time")
-                                        ),
-                                        "price": to_float(trade.get("price")),
-                                        "size": to_float(trade.get("size") or trade.get("base_amount")),
-                                        "side": str(trade.get("side") or trade.get("direction") or "").lower() or None,
-                                        "is_liquidation": 1 if trade.get("is_liquidation") else 0,
-                                        "raw_json": json.dumps(trade, ensure_ascii=True),
-                                    },
-                                )
-                                enqueue_count += 1
-
-                        elif topic == "market_stats":
-                            if isinstance(msg.get("market_stats"), dict):
-                                data = msg["market_stats"]
-                            state = market_state[mid]
-                            state["mark_price"] = to_float(data.get("mark_price"))
-                            state["index_price"] = to_float(data.get("index_price"))
-                            state["funding_rate"] = _extract_funding_rate(data)
-
-                            fts = ms_to_iso8601(data.get("funding_timestamp") or data.get("timestamp") or data.get("ts"))
-                            if fts and state.get("funding_rate") is not None:
-                                await writer.enqueue(
-                                    "funding",
-                                    {
-                                        "instrument_id": instrument_id,
-                                        "exchange_ts": fts,
-                                        "funding_rate": state.get("funding_rate"),
-                                        "mark_price": state.get("mark_price"),
-                                        "index_price": state.get("index_price"),
-                                        "raw_json": json.dumps(data, ensure_ascii=True),
-                                    },
-                                )
-                                enqueue_count += 1
-
-                        now_mono = time.monotonic()
-                        if now_mono - last_hb >= 5.0:
-                            logger.info(
-                                "ws heartbeat recv=%d enqueued=%d queue=%d reconnects=%d",
-                                recv_count,
-                                enqueue_count,
-                                writer.queue.qsize(),
-                                reconnects,
+                    elif topic == "trade":
+                        if isinstance(msg.get("trades"), list):
+                            trades = msg["trades"]
+                        else:
+                            trades = []
+                        if isinstance(msg.get("liquidation_trades"), list):
+                            trades.extend(msg["liquidation_trades"])
+                        if not trades:
+                            trades = data if isinstance(data, list) else [data]
+                        for trade in trades:
+                            if not isinstance(trade, dict):
+                                continue
+                            trade_id = str(trade.get("trade_id") or trade.get("id") or "")
+                            if not trade_id:
+                                continue
+                            await writer.enqueue(
+                                "trade",
+                                {
+                                    "instrument_id": instrument_id,
+                                    "trade_id": trade_id,
+                                    "exchange_ts": ms_to_iso8601(
+                                        trade.get("timestamp")
+                                        or trade.get("ts")
+                                        or trade.get("transaction_time")
+                                    ),
+                                    "price": to_float(trade.get("price")),
+                                    "size": to_float(trade.get("size") or trade.get("base_amount")),
+                                    "side": str(trade.get("side") or trade.get("direction") or "").lower() or None,
+                                    "is_liquidation": 1 if trade.get("is_liquidation") else 0,
+                                    "raw_json": json.dumps(trade, ensure_ascii=True),
+                                },
                             )
-                            last_hb = now_mono
-            except asyncio.CancelledError:
-                raise
-            except KeyboardInterrupt:
-                logger.info("lighter ws stream interrupted by user")
-                break
-            except ConnectionClosedError as exc:
-                reconnects += 1
-                logger.warning("lighter ws disconnected (will reconnect) code=%s reason=%s", exc.code, exc.reason)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, config.reconnect_max_sec)
-            except Exception as exc:
-                reconnects += 1
-                logger.exception("lighter ws disconnected, will reconnect error=%s", exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, config.reconnect_max_sec)
+                            metrics.enqueued_count += 1
+
+                    elif topic == "market_stats":
+                        if isinstance(msg.get("market_stats"), dict):
+                            data = msg["market_stats"]
+                        state = market_state[mid]
+                        state["mark_price"] = to_float(data.get("mark_price"))
+                        state["index_price"] = to_float(data.get("index_price"))
+                        state["funding_rate"] = _extract_funding_rate(data)
+
+                        fts = ms_to_iso8601(data.get("funding_timestamp") or data.get("timestamp") or data.get("ts"))
+                        if fts and state.get("funding_rate") is not None:
+                            await writer.enqueue(
+                                "funding",
+                                {
+                                    "instrument_id": instrument_id,
+                                    "exchange_ts": fts,
+                                    "funding_rate": state.get("funding_rate"),
+                                    "mark_price": state.get("mark_price"),
+                                    "index_price": state.get("index_price"),
+                                    "raw_json": json.dumps(data, ensure_ascii=True),
+                                },
+                            )
+                            metrics.enqueued_count += 1
+
+        except asyncio.CancelledError:
+            raise
+        except ConnectionClosedError as exc:
+            metrics.reconnects += 1
+            logger.warning(
+                "lighter ws disconnected shard=%d (will reconnect) code=%s reason=%s",
+                shard_id,
+                exc.code,
+                exc.reason,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, config.reconnect_max_sec)
+        except Exception as exc:
+            metrics.reconnects += 1
+            logger.exception("lighter ws shard error shard=%d error=%s", shard_id, exc)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, config.reconnect_max_sec)
+
+
+async def _heartbeat_loop(writer: SqliteStreamWriter, metrics: StreamMetrics, stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(5)
+        logger.info(
+            "ws heartbeat recv=%d enqueued=%d queue=%d reconnects=%d dropped_orderbook=%d dropped_snapshot=%d",
+            metrics.recv_count,
+            metrics.enqueued_count,
+            writer.queue.qsize(),
+            metrics.reconnects,
+            metrics.dropped_orderbook,
+            metrics.dropped_snapshot,
+        )
+
+
+async def run_lighter_ws_stream(config: StreamConfig) -> None:
+    client = LighterClient()
+    details = client.get_order_book_details()
+    discovered_market_ids = [
+        int(d.get("id") or d.get("market_id"))
+        for d in details
+        if (d.get("id") is not None or d.get("market_id") is not None)
+    ]
+    market_ids = config.market_ids or discovered_market_ids
+    market_set = set(market_ids)
+    details = [d for d in details if int(d.get("id") or d.get("market_id")) in market_set]
+
+    writer = SqliteStreamWriter(
+        config.db_path,
+        max_batch=config.writer_max_batch,
+        flush_interval_ms=config.writer_flush_interval_ms,
+    )
+    instrument_ids = writer.upsert_market_definitions(details)
+
+    metrics = StreamMetrics()
+    stop_event = asyncio.Event()
+
+    writer_task = asyncio.create_task(writer.run())
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(writer, metrics, stop_event))
+
+    shard_count = max(1, min(config.ws_shards, len(market_ids)))
+    market_shards = _shard_markets(market_ids, shard_count)
+    shard_tasks = [
+        asyncio.create_task(
+            _run_ws_shard(
+                shard_id=i,
+                mids=shard,
+                config=config,
+                writer=writer,
+                instrument_ids=instrument_ids,
+                metrics=metrics,
+                stop_event=stop_event,
+            )
+        )
+        for i, shard in enumerate(market_shards, start=1)
+    ]
+
+    logger.info("lighter ws stream starting markets=%d shards=%d", len(market_ids), len(shard_tasks))
+
+    try:
+        await asyncio.gather(*shard_tasks)
+    except KeyboardInterrupt:
+        logger.info("lighter ws stream interrupted by user")
     finally:
+        stop_event.set()
+        for task in shard_tasks:
+            task.cancel()
+        heartbeat_task.cancel()
         await writer.stop()
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.5)
         writer_task.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*shard_tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await heartbeat_task
         with contextlib.suppress(Exception):
             await writer_task
         writer.close()

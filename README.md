@@ -62,7 +62,7 @@ PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --
 PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --stream-lighter --stream-market-id 125 --ws-snapshot-interval-sec 2
 
 # 超低延迟写库（每条 ticker 都可落 snapshot；writer 10ms flush）
-PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --stream-lighter --ws-snapshot-interval-sec 0 --ws-writer-flush-ms 10 --ws-writer-max-batch 200 --log-level INFO
+PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --stream-lighter --ws-snapshot-interval-sec 0 --ws-writer-flush-ms 10 --ws-writer-max-batch 200 --ws-shards 4 --ws-queue-drop-threshold 15000 --log-level INFO
 ```
 
 ## 日志、run_id、重试统计

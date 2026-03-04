@@ -81,6 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=50,
         help="For --stream-lighter: flush interval in milliseconds for SQLite writer",
     )
+    parser.add_argument(
+        "--ws-shards",
+        type=int,
+        default=4,
+        help="For --stream-lighter: number of WebSocket shard connections",
+    )
+    parser.add_argument(
+        "--ws-queue-drop-threshold",
+        type=int,
+        default=15000,
+        help="For --stream-lighter: when queue exceeds this, drop low-priority events (snapshot/orderbook)",
+    )
     return parser
 
 
@@ -148,6 +160,8 @@ def main() -> None:
                     market_ids=args.stream_market_id,
                     writer_max_batch=args.ws_writer_max_batch,
                     writer_flush_interval_ms=args.ws_writer_flush_ms,
+                    ws_shards=args.ws_shards,
+                    queue_drop_threshold=args.ws_queue_drop_threshold,
                 )
             )
         )
