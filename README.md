@@ -65,6 +65,12 @@ PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --
 PYTHONPATH=src python -m exchange_monitor.main --db-path ./market_data.sqlite --stream-lighter --ws-snapshot-interval-sec 0 --ws-writer-flush-ms 10 --ws-writer-max-batch 200 --ws-shards 4 --ws-queue-drop-threshold 15000 --log-level INFO
 ```
 
+心跳日志会输出延时分位统计（p50/p95/p99）：
+- `lat_exch_recv`: 交易所时间戳 -> 本机接收
+- `lat_recv_enq`: 本机接收 -> 入队
+- `lat_queue_commit`: 入队 -> 提交写库
+- `lat_batch_commit`: 单批次SQLite提交耗时
+
 ## 日志、run_id、重试统计
 
 - 每次运行自动生成唯一 `run_id`（UTC 时间戳），可用 `--run-id` 自定义。
